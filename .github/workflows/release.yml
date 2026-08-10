@@ -1,0 +1,55 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-14
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+      - name: Build
+        run: ./build-app.sh --version ${{ steps.version.outputs.VERSION }}
+      - name: Package app
+        run: |
+          mv PMSet.app PMSet-${{ matrix.arch }}.app
+          zip -r PMSet-${{ matrix.arch }}.zip PMSet-${{ matrix.arch }}.app
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PMSet-${{ matrix.arch }}
+          path: PMSet-${{ matrix.arch }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/PMSet-arm64/PMSet-arm64.zip
+            artifacts/PMSet-x86_64/PMSet-x86_64.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
