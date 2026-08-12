@@ -24,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item("设置合盖不睡眠", #selector(setLidNoSleep)))
         menu.addItem(item("设置合盖睡眠（恢复默认）", #selector(setLidSleep)))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(item("启用 Touch ID 指纹授权", #selector(enableTouchID)))
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(item("退出App", #selector(quitApp)))
         return menu
     }
@@ -48,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func setLidSleep() {
         runInBackground { self.manager.setLidSleep() }
+    }
+
+    @objc private func enableTouchID() {
+        runInBackground { self.manager.enableTouchID() }
     }
 
     @objc private func quitApp() {
