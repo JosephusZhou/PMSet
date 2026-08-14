@@ -4,6 +4,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem?
     private let manager = PMSetManager()
+    private var lidNoSleepItem: NSMenuItem?
+    private var lidSleepItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -21,13 +23,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item("备份当前配置", #selector(backupConfig)))
         menu.addItem(item("恢复备份配置", #selector(restoreConfig)))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(item("设置合盖不睡眠", #selector(setLidNoSleep)))
-        menu.addItem(item("设置合盖睡眠（恢复默认）", #selector(setLidSleep)))
+        lidNoSleepItem = item("设置合盖不睡眠", #selector(setLidNoSleep))
+        lidSleepItem = item("设置合盖睡眠（恢复默认）", #selector(setLidSleep))
+        menu.addItem(lidNoSleepItem!)
+        menu.addItem(lidSleepItem!)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(item("启用 Touch ID 指纹授权", #selector(enableTouchID)))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(item("退出App", #selector(quitApp)))
+        refreshLidState()
         return menu
+    }
+
+    /// 根据当前电源设置，在「合盖不睡眠 / 合盖睡眠」前打勾
+    private func refreshLidState() {
+        let noSleep = manager.isLidNoSleepEnabled()
+        lidNoSleepItem?.state = noSleep ? .on : .off
+        lidSleepItem?.state = noSleep ? .off : .on
     }
 
     private func item(_ title: String, _ action: Selector) -> NSMenuItem {
@@ -41,15 +53,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restoreConfig() {
-        runInBackground { self.manager.restore() }
+        runInBackground {
+            self.manager.restore()
+            DispatchQueue.main.async { self.refreshLidState() }
+        }
     }
 
     @objc private func setLidNoSleep() {
-        runInBackground { self.manager.setLidNoSleep() }
+        runInBackground {
+            self.manager.setLidNoSleep()
+            DispatchQueue.main.async { self.refreshLidState() }
+        }
     }
 
     @objc private func setLidSleep() {
-        runInBackground { self.manager.setLidSleep() }
+        runInBackground {
+            self.manager.setLidSleep()
+            DispatchQueue.main.async { self.refreshLidState() }
+        }
     }
 
     @objc private func enableTouchID() {

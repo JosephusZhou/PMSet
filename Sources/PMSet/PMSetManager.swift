@@ -86,6 +86,13 @@ final class PMSetManager {
         }
     }
 
+    /// 当前是否为「合盖不睡眠」状态（hibernatemode=0 或 disablesleep=1）
+    func isLidNoSleepEnabled() -> Bool {
+        let output = capture("/usr/bin/pmset", ["-g", "custom"]).output
+        if value(for: "disablesleep", in: output) == "1" { return true }
+        return value(for: "hibernatemode", in: output) == "0"
+    }
+
     // MARK: - 管理员授权
 
     /// 是否已配置 Touch ID 指纹授权（/etc/pam.d 中存在未被注释的 pam_tid.so）
