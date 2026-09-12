@@ -28,8 +28,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(lidNoSleepItem!)
         menu.addItem(lidSleepItem!)
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(item("启用 Touch ID 指纹授权", #selector(enableTouchID)))
-        menu.addItem(NSMenuItem.separator())
         menu.addItem(item("退出App", #selector(quitApp)))
         refreshLidState()
         return menu
@@ -71,10 +69,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.manager.setLidSleep()
             DispatchQueue.main.async { self.refreshLidState() }
         }
-    }
-
-    @objc private func enableTouchID() {
-        runInBackground { self.manager.enableTouchID() }
     }
 
     @objc private func quitApp() {

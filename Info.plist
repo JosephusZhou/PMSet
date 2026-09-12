@@ -19,14 +19,25 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.3</string>
+    <string>1.1.1</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!--
+      预留配置：SMJobBless 特权 Helper Tool 方案。
+      当前版本未启用（采用 AppleScript 方式，无需证书）。
+      未来获得固定代码签名证书后，可启用此方案实现"授权一次、永久静默"。
+      详见 Sources/PMSet/PrivilegedHelperManager.swift 顶部说明。
+    -->
+    <key>SMPrivilegedExecutables</key>
+    <dict>
+        <key>local.pmset.helper</key>
+        <string>identifier "local.pmset.helper"</string>
+    </dict>
 </dict>
 </plist>
