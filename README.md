@@ -52,8 +52,8 @@
 ### 自动构建
 
 当推送版本标签（如 `v1.0.0`）到 GitHub 时，GitHub Actions 会自动：
-1. 在 macOS Intel 和 Apple Silicon 环境分别构建
-2. 生成对应的 `PMSet-x86_64.zip` 和 `PMSet-arm64.zip`
+1. 构建 universal 二进制，并分别抽取为 arm64 / x86_64 版本
+2. 生成对应的 `PMSet-arm64.dmg` 和 `PMSet-x86_64.dmg`
 3. 创建 GitHub Release 并上传构建产物
 
 使用方法：
