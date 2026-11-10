@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.addItem(item("备份当前配置", #selector(backupConfig)))
         menu.addItem(item("恢复备份配置", #selector(restoreConfig)))
         menu.addItem(NSMenuItem.separator())
@@ -38,6 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lidSleepItem = item("设置合盖睡眠（恢复默认）", #selector(setLidSleep))
         menu.addItem(lidNoSleepItem!)
         menu.addItem(lidSleepItem!)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(item("关于", #selector(openAbout)))
+        // 版本号仅作展示：不设置 action，点击无响应，但保持与普通菜单项一致的文字颜色
+        let versionItem = NSMenuItem(
+            title: "当前版本：v\(Bundle.main.version)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        menu.addItem(versionItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(item("退出App", #selector(quitApp)))
         refreshLidState()
@@ -83,11 +93,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func openAbout() {
+        guard let url = URL(string: "https://github.com/JosephusZhou/PMSet") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     @objc private func quitApp() {
         NSApp.terminate(nil)
     }
 
     private func runInBackground(_ work: @escaping () -> Void) {
         DispatchQueue.global(qos: .userInitiated).async(execute: work)
+    }
+}
+
+private extension Bundle {
+    /// 应用版本号，取自 Info.plist；开发环境下无该字段时回退为「未知」。
+    var version: String {
+        infoDictionary?["CFBundleShortVersionString"] as? String ?? "未知"
     }
 }
