@@ -9,13 +9,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = item.button {
-            button.image = NSImage(systemSymbolName: "moon.zzz.fill", accessibilityDescription: "PMSet")
-            button.image?.isTemplate = true
-            button.toolTip = "PMSet"
-        }
-        item.menu = makeMenu()
+        item.button?.toolTip = "PMSet"
         statusItem = item
+        item.menu = makeMenu()
+    }
+
+    /// 根据「合盖不睡眠」状态返回菜单栏图标。
+    /// 新图标以模板图方式渲染，自动适配浅色/深色菜单栏与选中高亮。
+    private func statusIcon(noSleep: Bool) -> NSImage? {
+        let name = noSleep ? "MenuBarAwake" : "MenuBarSleep"
+        if let image = NSImage(named: name) {
+            image.isTemplate = true
+            return image
+        }
+        // 开发环境（swift run，无 Resources）下回退到系统符号
+        return NSImage(
+            systemSymbolName: noSleep ? "bolt.fill" : "moon.zzz.fill",
+            accessibilityDescription: "PMSet"
+        )
     }
 
     private func makeMenu() -> NSMenu {
@@ -38,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let noSleep = manager.isLidNoSleepEnabled()
         lidNoSleepItem?.state = noSleep ? .on : .off
         lidSleepItem?.state = noSleep ? .off : .on
+        statusItem?.button?.image = statusIcon(noSleep: noSleep)
     }
 
     private func item(_ title: String, _ action: Selector) -> NSMenuItem {

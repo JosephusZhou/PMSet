@@ -34,21 +34,25 @@ else
 fi
 
 echo "==> generating icon"
-if [ ! -f "PMSet.icns" ]; then
-    swift make-icon.swift
+ICON_SOURCE="Resources/AppIcon-1024.png"
+if [ ! -f "$ICON_SOURCE" ]; then
+    echo "    ERROR: missing icon source $ICON_SOURCE"
+    exit 1
+fi
+if [ ! -f "PMSet.icns" ] || [ "$ICON_SOURCE" -nt "PMSet.icns" ]; then
     rm -rf icon.iconset && mkdir -p icon.iconset
-    sips -z 16 16 icon-1024.png --out icon.iconset/icon_16x16.png >/dev/null
-    sips -z 32 32 icon-1024.png --out icon.iconset/icon_16x16@2x.png >/dev/null
-    sips -z 32 32 icon-1024.png --out icon.iconset/icon_32x32.png >/dev/null
-    sips -z 64 64 icon-1024.png --out icon.iconset/icon_32x32@2x.png >/dev/null
-    sips -z 128 128 icon-1024.png --out icon.iconset/icon_128x128.png >/dev/null
-    sips -z 256 256 icon-1024.png --out icon.iconset/icon_128x128@2x.png >/dev/null
-    sips -z 256 256 icon-1024.png --out icon.iconset/icon_256x256.png >/dev/null
-    sips -z 512 512 icon-1024.png --out icon.iconset/icon_256x256@2x.png >/dev/null
-    sips -z 512 512 icon-1024.png --out icon.iconset/icon_512x512.png >/dev/null
-    cp icon-1024.png icon.iconset/icon_512x512@2x.png
+    sips -z 16 16 "$ICON_SOURCE" --out icon.iconset/icon_16x16.png >/dev/null
+    sips -z 32 32 "$ICON_SOURCE" --out icon.iconset/icon_16x16@2x.png >/dev/null
+    sips -z 32 32 "$ICON_SOURCE" --out icon.iconset/icon_32x32.png >/dev/null
+    sips -z 64 64 "$ICON_SOURCE" --out icon.iconset/icon_32x32@2x.png >/dev/null
+    sips -z 128 128 "$ICON_SOURCE" --out icon.iconset/icon_128x128.png >/dev/null
+    sips -z 256 256 "$ICON_SOURCE" --out icon.iconset/icon_128x128@2x.png >/dev/null
+    sips -z 256 256 "$ICON_SOURCE" --out icon.iconset/icon_256x256.png >/dev/null
+    sips -z 512 512 "$ICON_SOURCE" --out icon.iconset/icon_256x256@2x.png >/dev/null
+    sips -z 512 512 "$ICON_SOURCE" --out icon.iconset/icon_512x512.png >/dev/null
+    cp "$ICON_SOURCE" icon.iconset/icon_512x512@2x.png
     iconutil -c icns icon.iconset -o PMSet.icns
-    rm -rf icon.iconset icon-1024.png
+    rm -rf icon.iconset
 fi
 
 echo "==> assembling PMSet.app"
@@ -68,6 +72,10 @@ cp .build/release/PMSetHelper "$APP/Contents/Library/LaunchServices/local.pmset.
 
 cp PMSet.icns "$APP/Contents/Resources/PMSet.icns"
 cp Info.plist "$APP/Contents/Info.plist"
+
+# 菜单栏图标（模板图，含 @2x / @3x）
+cp Resources/MenuBarAwake*.png "$APP/Contents/Resources/"
+cp Resources/MenuBarSleep*.png "$APP/Contents/Resources/"
 
 if [[ -n "$VERSION" ]]; then
     echo "==> setting version to $VERSION"
