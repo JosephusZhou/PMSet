@@ -36,6 +36,10 @@ final class PrivilegedHelperManager {
         "/Library/PrivilegedHelperTools/\(helperBundleID)"
     }
 
+    private var helperLaunchdPlistPath: String {
+        "/Library/LaunchDaemons/\(helperBundleID).plist"
+    }
+
     /// App bundle 内 Helper 的路径（SMJobBless 从这里读取）。
     private var bundledHelperPath: String? {
         Bundle.main.path(forAuxiliaryExecutable: helperBundleID)
@@ -48,8 +52,16 @@ final class PrivilegedHelperManager {
 
     private var connection: NSXPCConnection?
     private let connectionLock = NSLock()
+    /// 串行化 Helper 的安装、卸载与就绪检查，避免并发弹窗或边卸载边 XPC 调用
+    private let lifecycleLock = NSLock()
+    private let autoInstallDisabledKey = "helperAutoInstallDisabled"
     /// 最近一次安装失败的错误信息，供 UI 展示。
     private(set) var lastErrorMessage: String = ""
+
+    private var isAutoInstallDisabled: Bool {
+        get { UserDefaults.standard.bool(forKey: autoInstallDisabledKey) }
+        set { UserDefaults.standard.set(newValue, forKey: autoInstallDisabledKey) }
+    }
 
     private init() {}
 
@@ -123,6 +135,12 @@ final class PrivilegedHelperManager {
 
     var isHelperInstalled: Bool {
         FileManager.default.fileExists(atPath: helperInstallPath)
+            && FileManager.default.fileExists(atPath: helperLaunchdPlistPath)
+    }
+
+    private var hasAnyHelperArtifact: Bool {
+        FileManager.default.fileExists(atPath: helperInstallPath)
+            || FileManager.default.fileExists(atPath: helperLaunchdPlistPath)
     }
 
     func isHelperVersionCompatible() -> Bool {
@@ -152,9 +170,20 @@ final class PrivilegedHelperManager {
 
     // MARK: - 安装
 
-    /// 调用 SMJobBless 安装 Helper，返回 (是否成功, 错误信息)。
+    /// 调用 SMJobBless 安装 Helper，返回 (是否成功, 是否用户取消, 错误信息)。
     @discardableResult
-    func installHelper() -> (success: Bool, errorMessage: String) {
+    func installHelper() -> (success: Bool, canceled: Bool, errorMessage: String) {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        // 避免等待确认框期间后台已完成安装而再次弹出授权框
+        if isHelperInstalled && isHelperVersionCompatible() {
+            isAutoInstallDisabled = false
+            return (true, false, "")
+        }
+        return installHelperLocked()
+    }
+
+    private func installHelperLocked() -> (success: Bool, canceled: Bool, errorMessage: String) {
         // 安装前诊断
         let issues = diagnose()
         if !issues.isEmpty {
@@ -164,7 +193,7 @@ final class PrivilegedHelperManager {
             }
         }
 
-        // 创建 AuthorizationRef
+        // 创建 AuthorizationRef 并预申请 bless 权限，以明确区分用户取消与授权失败
         var authRef: AuthorizationRef?
         let authStatus = AuthorizationCreate(nil, nil, [], &authRef)
 
@@ -172,16 +201,37 @@ final class PrivilegedHelperManager {
             let msg = "用户取消了授权。"
             NSLog("PMSet: \(msg)")
             lastErrorMessage = msg
-            return (false, msg)
+            return (false, true, msg)
         }
 
         guard authStatus == errAuthorizationSuccess, let auth = authRef else {
             let msg = "无法创建授权会话（状态码 \(authStatus)）。"
             NSLog("PMSet: \(msg)")
             lastErrorMessage = msg
-            return (false, msg)
+            return (false, false, msg)
         }
         defer { AuthorizationFree(auth, []) }
+
+        let rightStatus = kSMRightBlessPrivilegedHelper.withCString { rightName in
+            var item = AuthorizationItem(name: rightName, valueLength: 0, value: nil, flags: 0)
+            return withUnsafeMutablePointer(to: &item) { itemPtr in
+                var rights = AuthorizationRights(count: 1, items: itemPtr)
+                let flags: AuthorizationFlags = [.interactionAllowed, .extendRights, .preAuthorize]
+                return AuthorizationCopyRights(auth, &rights, nil, flags, nil)
+            }
+        }
+        if rightStatus == errAuthorizationCanceled {
+            let msg = "用户取消了授权。"
+            NSLog("PMSet: \(msg)")
+            lastErrorMessage = msg
+            return (false, true, msg)
+        }
+        if rightStatus != errAuthorizationSuccess {
+            let msg = "获取安装授权失败（状态码 \(rightStatus)）。"
+            NSLog("PMSet: \(msg)")
+            lastErrorMessage = msg
+            return (false, false, msg)
+        }
 
         // 调用 SMJobBless
         var error: Unmanaged<CFError>?
@@ -194,13 +244,15 @@ final class PrivilegedHelperManager {
 
         if success {
             NSLog("PMSet: SMJobBless succeeded")
+            isAutoInstallDisabled = false
             lastErrorMessage = ""
             resetConnection()
-            return (true, "")
+            return (true, false, "")
         }
 
         // 失败：提取详细错误信息
         var message = "SMJobBless 安装失败"
+        var canceled = false
         if let cfError = error?.takeRetainedValue() {
             let nsError = cfError as Error
             message = "\(nsError.localizedDescription)"
@@ -222,13 +274,14 @@ final class PrivilegedHelperManager {
             NSLog("PMSet: SMJobBless failed: domain=\(domain), code=\(code), message=\(message)")
 
             if code == Int(errAuthorizationCanceled) {
+                canceled = true
                 message = "用户取消了授权。"
             } else if domain == "com.apple.ServiceManagement" {
                 switch code {
                 case 3:
                     message += "（错误码 3：签名无效或 requirement 不匹配）"
                 case 4:
-                    message += "（错误码 4：授权已取消或失败）"
+                    message += "（错误码 4：授权失败）"
                 case 5:
                     message += "（错误码 5：Helper 工具无效或 Info.plist 缺失）"
                 case 7:
@@ -244,16 +297,88 @@ final class PrivilegedHelperManager {
         }
 
         lastErrorMessage = message
-        return (false, message)
+        return (false, canceled, message)
+    }
+
+    /// 通过管理员权限卸载 launchd 任务与磁盘上的 Helper 文件。
+    @discardableResult
+    func uninstallHelper() -> (success: Bool, canceled: Bool, errorMessage: String) {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if !hasAnyHelperArtifact {
+            isAutoInstallDisabled = true
+            lastErrorMessage = ""
+            resetConnection()
+            return (true, false, "")
+        }
+        return uninstallHelperLocked()
+    }
+
+    private func uninstallHelperLocked() -> (success: Bool, canceled: Bool, errorMessage: String) {
+        let command = "/bin/launchctl bootout system/\(helperBundleID) 2>/dev/null || true; " +
+            "/bin/rm -f '\(helperLaunchdPlistPath)' '\(helperInstallPath)'"
+        let result = Self.executeAsAdminViaAppleScript(
+            command,
+            prompt: "PMSet 需要管理员权限来卸载辅助工具"
+        )
+        if result.success {
+            NSLog("PMSet: helper uninstalled")
+            isAutoInstallDisabled = true
+            lastErrorMessage = ""
+            resetConnection()
+            return (true, false, "")
+        }
+        NSLog("PMSet: helper uninstall failed: \(result.message)")
+        lastErrorMessage = result.message
+        return (false, result.canceled, result.message)
     }
 
     /// 确保 Helper 已安装且版本正确；如需要则触发安装。
     @discardableResult
-    func ensureHelperReady() -> (success: Bool, errorMessage: String) {
+    func ensureHelperReady() -> (success: Bool, canceled: Bool, errorMessage: String) {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return ensureHelperReadyLocked()
+    }
+
+    private func ensureHelperReadyLocked() -> (success: Bool, canceled: Bool, errorMessage: String) {
         if isHelperInstalled && isHelperVersionCompatible() {
-            return (true, "")
+            return (true, false, "")
         }
-        return installHelper()
+        // 用户主动卸载后不再自动重装，直接交由上层走管理员密码路径
+        if !isHelperInstalled && isAutoInstallDisabled {
+            return (false, false, "辅助工具已卸载，跳过自动安装。")
+        }
+        return installHelperLocked()
+    }
+
+    // MARK: - 管理员 AppleScript（回退与卸载共用）
+
+    /// AppleScript 提权执行 shell 命令；注意不支持 Touch ID。
+    static func executeAsAdminViaAppleScript(
+        _ shellCommand: String,
+        prompt: String = "PMSet 需要管理员权限来修改电源设置"
+    ) -> (success: Bool, canceled: Bool, message: String) {
+        // 转义命令与提示语中的反斜杠和双引号，确保嵌入 AppleScript 字符串后语法正确
+        let escape: (String) -> String = { text in
+            text.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let script = "do shell script \"\(escape(shellCommand))\" with administrator privileges with prompt \"\(escape(prompt))\""
+
+        var error: NSDictionary?
+        guard let appleScript = NSAppleScript(source: script) else {
+            return (false, false, "无法创建 AppleScript 实例。")
+        }
+
+        appleScript.executeAndReturnError(&error)
+
+        if let error = error {
+            let errorNumber = error[NSAppleScript.errorNumber] as? Int
+            let message = (error[NSAppleScript.errorMessage] as? String) ?? "未知错误"
+            return (false, errorNumber == -128, message)
+        }
+        return (true, false, "")
     }
 
     // MARK: - XPC 通信
@@ -303,25 +428,25 @@ final class PrivilegedHelperManager {
     /// 便捷方法：确保 Helper 就绪后，以 root 身份执行一组命令。
     func runCommands(
         _ commands: [String],
-        completion: @escaping (_ success: Bool, _ output: String) -> Void
+        completion: @escaping (_ success: Bool, _ canceled: Bool, _ output: String) -> Void
     ) {
         let finishLock = NSLock()
         var finished = false
-        let finish: (Bool, String) -> Void = { success, output in
+        let finish: (Bool, Bool, String) -> Void = { success, canceled, output in
             finishLock.lock()
             let alreadyFinished = finished
             finished = true
             finishLock.unlock()
             guard !alreadyFinished else { return }
             DispatchQueue.main.async {
-                completion(success, output)
+                completion(success, canceled, output)
             }
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let ready = self.ensureHelperReady()
             guard ready.success else {
-                finish(false, ready.errorMessage)
+                finish(false, ready.canceled, ready.errorMessage)
                 return
             }
 
@@ -332,16 +457,16 @@ final class PrivilegedHelperManager {
                     self?.resetConnection(ifMatching: conn)
                     conn.invalidate()
                 }
-                finish(false, "XPC 通信失败：\(error.localizedDescription)")
+                finish(false, false, "XPC 通信失败：\(error.localizedDescription)")
             } as? HelperProtocol
 
             guard let helper = proxy else {
-                finish(false, "无法连接到特权辅助工具。")
+                finish(false, false, "无法连接到特权辅助工具。")
                 return
             }
 
             helper.runCommands(commands) { success, output in
-                finish(success, output)
+                finish(success, false, output)
             }
         }
     }

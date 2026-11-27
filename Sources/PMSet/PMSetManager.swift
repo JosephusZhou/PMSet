@@ -75,10 +75,10 @@ final class PMSetManager {
             showError("恢复失败", "备份文件为空或格式不正确。")
             return
         }
-        runPrivileged(commands) { success, message in
+        runPrivileged(commands) { success, canceled, message in
             if success {
                 self.showInfo("恢复完成", "已按备份文件恢复 \(commands.count) 项电源配置。")
-            } else if !Self.isUserCanceled(message) {
+            } else if !canceled {
                 self.showError("恢复失败", message)
             }
         }
@@ -174,10 +174,10 @@ final class PMSetManager {
             let turnsOffDisableSleep = snapshot.value(for: "disablesleep") == 1
                 && ordered.contains { $0.key == "disablesleep" && $0.value == 0 }
 
-            self.runPrivileged(commands) { success, message in
+            self.runPrivileged(commands) { success, canceled, message in
                 guard success else {
                     var report = base
-                    let reason = Self.isUserCanceled(message) ? "用户取消了授权" : message
+                    let reason = canceled ? "用户取消了授权" : message
                     for target in ordered {
                         report.failedKeys[target.key] = "未写入"
                     }
@@ -254,10 +254,10 @@ final class PMSetManager {
                 "/usr/bin/pmset restoredefaults",
                 "/usr/bin/pmset -a disablesleep 0"
             ]
-            self.runPrivileged(commands) { success, message in
+            self.runPrivileged(commands) { success, canceled, message in
                 guard success else {
                     var report = ApplyReport()
-                    let reason = Self.isUserCanceled(message) ? "用户取消了授权" : message
+                    let reason = canceled ? "用户取消了授权" : message
                     report.failedKeys["restoredefaults"] = "未执行"
                     report.message = "恢复默认设置失败：\(reason)"
                     completion(report)
@@ -321,7 +321,7 @@ final class PMSetManager {
             completion(false)
             return
         }
-        runPrivileged(["/usr/bin/pmset sleepnow"]) { success, _ in
+        runPrivileged(["/usr/bin/pmset sleepnow"]) { success, _, _ in
             completion(success)
         }
     }
@@ -356,62 +356,27 @@ final class PMSetManager {
     /// 回调固定回到主线程。
     private func runPrivileged(
         _ commands: [String],
-        completion: @escaping (_ success: Bool, _ message: String) -> Void
+        completion: @escaping (_ success: Bool, _ canceled: Bool, _ message: String) -> Void
     ) {
-        PrivilegedHelperManager.shared.runCommands(commands) { success, output in
+        PrivilegedHelperManager.shared.runCommands(commands) { success, canceled, output in
             if success {
-                completion(true, output)
+                completion(true, false, output)
                 return
             }
-            if Self.isUserCanceled(output) {
-                completion(false, output)
+            if canceled {
+                completion(false, true, output)
                 return
             }
             NSLog("PMSet: helper 执行失败，回退 AppleScript：\(output)")
 
             // Helper 不可用（未安装 / 签名不符 / 版本不匹配 / XPC 失败）：回退密码方式，用 && 保持失败即停语义
             DispatchQueue.global(qos: .userInitiated).async {
-                let fallback = self.executeAsAdminViaAppleScript(commands.joined(separator: " && "))
+                let fallback = PrivilegedHelperManager.executeAsAdminViaAppleScript(commands.joined(separator: " && "))
                 DispatchQueue.main.async {
-                    completion(fallback.success, fallback.success ? "" : fallback.message)
+                    completion(fallback.success, fallback.canceled, fallback.success ? "" : fallback.message)
                 }
             }
         }
-    }
-
-    /// AppleScript 密码方式（回退路径）：`do shell script ... with administrator privileges`。
-    /// 多条命令用 `&&` 连接，确保前一条失败时不再执行后续命令，且每次操作只需输入一次密码。
-    /// 注意：不支持 Touch ID，且仅在特权 Helper 不可用时才会走到这里。
-    private func executeAsAdminViaAppleScript(_ shellCommand: String) -> AppleScriptResult {
-        // 转义命令中的反斜杠和双引号，确保嵌入 AppleScript 字符串后语法正确
-        let escaped = shellCommand
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-
-        let script = "do shell script \"\(escaped)\" with administrator privileges with prompt \"PMSet 需要管理员权限来修改电源设置\""
-
-        var error: NSDictionary?
-        guard let appleScript = NSAppleScript(source: script) else {
-            return AppleScriptResult(success: false, message: "无法创建 AppleScript 实例。")
-        }
-
-        appleScript.executeAndReturnError(&error)
-
-        if let error = error {
-            let message = (error[NSAppleScript.errorMessage] as? String) ?? "未知错误"
-            return AppleScriptResult(success: false, message: message)
-        }
-        return AppleScriptResult(success: true, message: "")
-    }
-
-    private struct AppleScriptResult {
-        let success: Bool
-        let message: String
-    }
-
-    /// 用户取消授权不算错误，调用方不应弹错误框。
-    private static func isUserCanceled(_ message: String) -> Bool {
-        message.contains("User canceled") || message.contains("取消")
     }
 
     // MARK: - 私有工具

@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 首次启动的禁止睡眠提示只弹一次
     private var didShowStartupWarning = false
+    /// 避免重复弹出 Helper 安装 / 卸载授权框
+    private var isManagingHelper = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -57,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// 按固定顺序重建菜单：查看方案 / 分隔线 / 默认睡眠方案 / 前两个自定义方案 /
-    /// 更多（条件） / 分隔线 / 关于 / 当前版本 / 分隔线 / 退出 App。
+    /// 更多（条件） / 分隔线 / 辅助工具状态 / 当前版本 / 关于 / 退出。
     func rebuildMenu() {
         guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
@@ -89,13 +91,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(item("关于", #selector(openAbout)))
+        menu.addItem(helperStatusItem())
         // 版本号仅作展示：不设置 action，点击无响应
         menu.addItem(
             NSMenuItem(title: "当前版本：v\(Bundle.main.version)", action: nil, keyEquivalent: "")
         )
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(item("退出 App", #selector(quitApp)))
+        menu.addItem(item("关于", #selector(openAbout)))
+        menu.addItem(item("退出", #selector(quitApp)))
 
         // 图标以回读的实际值为准
         statusItem?.button?.image = statusIcon(noSleep: snapshot.sleepDisabled)
@@ -139,6 +141,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menuItem = item(preset.name, #selector(presetClicked(_:)))
         menuItem.representedObject = preset.id
         menuItem.state = checked ? .on : .off
+        return menuItem
+    }
+
+    private func helperStatusItem() -> NSMenuItem {
+        let installed = PrivilegedHelperManager.shared.isHelperInstalled
+        let title = isManagingHelper
+            ? "辅助工具：处理中..."
+            : (installed ? "辅助工具：已安装" : "辅助工具：未安装")
+        let menuItem = item(title, #selector(toggleHelperInstall))
+        menuItem.isEnabled = !isManagingHelper
         return menuItem
     }
 
@@ -195,6 +207,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.alertStyle = failed.isEmpty ? .informational : .warning
         alert.messageText = failed.isEmpty ? "「\(presetName)」已应用" : "「\(presetName)」应用未完成"
         alert.informativeText = lines.joined(separator: "\n\n")
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    @objc private func toggleHelperInstall() {
+        guard !isManagingHelper else { return }
+
+        let installed = PrivilegedHelperManager.shared.isHelperInstalled
+        let alert = NSAlert()
+        alert.alertStyle = installed ? .warning : .informational
+        alert.messageText = installed ? "卸载辅助工具？" : "安装辅助工具？"
+        alert.informativeText = installed
+            ? "卸载后，修改电源设置将不再免密静默执行，每次需要输入管理员密码。"
+            : "安装后，修改电源设置可免密静默执行。安装过程需要输入一次管理员密码完成授权。"
+        alert.addButton(withTitle: installed ? "卸载" : "安装")
+        alert.addButton(withTitle: "取消")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        isManagingHelper = true
+        rebuildMenu()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = installed
+                ? PrivilegedHelperManager.shared.uninstallHelper()
+                : PrivilegedHelperManager.shared.installHelper()
+
+            DispatchQueue.main.async {
+                self.isManagingHelper = false
+                self.rebuildMenu()
+
+                if result.success {
+                    self.showSimpleAlert(
+                        title: installed ? "辅助工具已卸载" : "辅助工具已安装",
+                        message: installed
+                            ? "后续修改电源设置将恢复为通过管理员密码授权执行。"
+                            : "后续修改电源设置将通过辅助工具静默执行，不再每次提示输入密码。",
+                        style: .informational
+                    )
+                } else if !result.canceled {
+                    self.showSimpleAlert(
+                        title: installed ? "辅助工具卸载失败" : "辅助工具安装失败",
+                        message: result.errorMessage,
+                        style: .warning
+                    )
+                }
+            }
+        }
+    }
+
+    private func showSimpleAlert(title: String, message: String, style: NSAlert.Style) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = style
+        alert.messageText = title
+        alert.informativeText = message
         alert.addButton(withTitle: "好")
         alert.runModal()
     }
