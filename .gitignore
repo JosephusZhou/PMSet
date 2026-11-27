@@ -13,3 +13,11 @@ Package.resolved
 # 构建产物
 PMSet.app/
 PMSet.dSYM/
+
+.agents/
+.pi/
+AGENTS.md
+
+docs/memory/
+docs/research/
+
