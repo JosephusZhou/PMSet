@@ -40,8 +40,9 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           APP=PMSet.app
           rm -rf "$APP"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchServices"
           cp .build/apple/Products/Release/PMSet "$APP/Contents/MacOS/PMSet"
+          cp .build/apple/Products/Release/PMSetHelper "$APP/Contents/Library/LaunchServices/local.pmset.helper"
           cp PMSet.icns "$APP/Contents/Resources/PMSet.icns"
           cp Info.plist "$APP/Contents/Info.plist"
           cp Resources/MenuBarAwake*.png "$APP/Contents/Resources/"
@@ -50,6 +51,7 @@ jobs:
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
           fi
+          codesign --force --sign - "$APP/Contents/Library/LaunchServices/local.pmset.helper"
           codesign --force --sign - "$APP"
           file "$APP/Contents/MacOS/PMSet"
       - name: Package DMG (arm64)

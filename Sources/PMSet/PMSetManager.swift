@@ -1,23 +1,30 @@
 import AppKit
 import Foundation
 
-/// 电源配置管理：备份、恢复、合盖不睡眠切换。
+/// 一次方案应用的结果。
+struct ApplyReport {
+    /// 实际下发并回读校验通过的键
+    var appliedKeys: [String] = []
+    /// 本机不存在而跳过的键
+    var skippedKeys: [String] = []
+    /// 失败键 → 失败原因
+    var failedKeys: [String: String] = [:]
+    /// 给用户看的中文摘要（可为空）
+    var message: String = ""
+    /// 是否已经弹过「合盖状态下不会立即入睡」的询问框（调用方据此避免再弹成功框）
+    var promptedSleepNow: Bool = false
+
+    var success: Bool { failedKeys.isEmpty }
+}
+
+/// 电源配置管理：备份、恢复、方案应用。
 ///
-/// 特权操作通过 AppleScript（`do shell script ... with administrator privileges`）
-/// 执行，系统会弹出密码输入框，输入密码后以 root 身份执行。
-/// 无需代码签名证书，ad-hoc 签名即可。
-///
-/// 注意：AppleScript 方式的授权框仅支持密码输入，不支持 Touch ID。
-/// 若未来需要指纹授权或"授权一次、永久静默"，可切换到 SMJobBless 方案
-/// （详见 PrivilegedHelperManager.swift 顶部预留说明）。
-///
-/// 多条 pmset 命令合并为一条 shell 命令（用 `;` 连接），因此每次操作只需输入一次密码。
+/// 所有特权写入统一走 `runPrivileged(_:completion:)`：优先使用 SMJobBless 特权 Helper
+/// （授权一次后静默执行），Helper 不可用时自动回退 AppleScript 密码方式。
 final class PMSetManager {
 
-    private let keys = [
-        "disablesleep", "sleep", "standby", "autopoweroff",
-        "hibernatemode", "tcpkeepalive", "womp", "displaysleep", "disksleep"
-    ]
+    /// 已知的 9 个电源配置键（参数名），用于备份、恢复与方案下发
+    private let keys = PowerKey.allKeys
 
     private var backupURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -29,10 +36,11 @@ final class PMSetManager {
     // MARK: - 备份（只读，无需管理员权限）
 
     func backup() {
-        let output = capture("/usr/bin/pmset", ["-g"]).output + "\n" + capture("/usr/bin/pmset", ["-g", "custom"]).output
+        // 备份写参数名：disablesleep 由 `pmset -g` 的 SleepDisabled 映射而来
+        let snapshot = SystemPowerReader().snapshot()
         var lines: [String] = []
         for key in keys {
-            if let value = value(for: key, in: output) {
+            if let value = snapshot.value(for: key) {
                 lines.append("\(key) \(value)")
             }
         }
@@ -67,64 +75,314 @@ final class PMSetManager {
             showError("恢复失败", "备份文件为空或格式不正确。")
             return
         }
-        if runAsAdmin(commands.joined(separator: "; ")) {
-            showInfo("恢复完成", "已按备份文件恢复 \(commands.count) 项电源配置。")
+        runPrivileged(commands) { success, message in
+            if success {
+                self.showInfo("恢复完成", "已按备份文件恢复 \(commands.count) 项电源配置。")
+            } else if !Self.isUserCanceled(message) {
+                self.showError("恢复失败", message)
+            }
         }
     }
 
-    // MARK: - 合盖不睡眠（需要管理员权限）
-
-    func setLidNoSleep() {
-        let command = [
-            "/usr/bin/pmset -a disablesleep 1",
-            "/usr/bin/pmset -a sleep 0",
-            "/usr/bin/pmset -a standby 0",
-            "/usr/bin/pmset -a autopoweroff 0",
-            "/usr/bin/pmset -a hibernatemode 0",
-            "/usr/bin/pmset -a displaysleep 0",
-            "/usr/bin/pmset -a disksleep 0",
-            "/usr/bin/pmset -a tcpkeepalive 1",
-            "/usr/bin/pmset -a womp 1"
-        ].joined(separator: "; ")
-
-        if runAsAdmin(command) {
-            showInfo(
-                "已设置合盖不睡眠",
-                "请插上电源适配器使用。无风扇机型长时间运行可能发热。\n\n需要恢复时选择「设置合盖睡眠（恢复默认）」或「恢复备份配置」。"
-            )
-        }
-    }
-
-    func setLidSleep() {
-        let command = [
-            "/usr/bin/pmset -a disablesleep 0",
-            "/usr/bin/pmset -a sleep 1",
-            "/usr/bin/pmset -a standby 1",
-            "/usr/bin/pmset -a autopoweroff 1",
-            "/usr/bin/pmset -a hibernatemode 3"
-        ].joined(separator: "; ")
-
-        if runAsAdmin(command) {
-            showInfo("已恢复合盖睡眠", "电源设置已恢复为默认睡眠行为。")
-        }
-    }
-
-    /// 当前是否为「合盖不睡眠」状态（只读，无需管理员权限）。
+    /// 当前是否禁止睡眠（只读，无需管理员权限）。以 `pmset -g` 的 SleepDisabled 为准。
     func isLidNoSleepEnabled() -> Bool {
-        let output = capture("/usr/bin/pmset", ["-g", "custom"]).output
-        if value(for: "disablesleep", in: output) == "1" { return true }
-        return value(for: "hibernatemode", in: output) == "0"
+        SystemPowerReader().snapshot().sleepDisabled
     }
 
-    // MARK: - 管理员授权（AppleScript 方式）
+    // MARK: - 方案应用
 
-    /// 通过 AppleScript 以管理员权限执行一条 shell 命令。
-    /// 系统会弹出密码输入框，输入密码后执行。
-    /// 注意：此授权框仅支持密码输入，不支持 Touch ID。
-    /// - Parameter shellCommand: 要执行的 shell 命令（可包含多条，用 `;` 连接）。
-    /// - Returns: 是否执行成功。
-    @discardableResult
-    private func runAsAdmin(_ shellCommand: String) -> Bool {
+    /// 应用一套具名方案：只下发与当前实际值有差异的键，执行后回读校验；
+    /// 全部成功时把该方案记为当前生效方案。
+    func applyPreset(_ preset: Preset, completion: @escaping (ApplyReport) -> Void) {
+        if preset.id == Preset.builtinDefaultID {
+            applyBuiltinDefaultPreset(completion: completion)
+            return
+        }
+        apply(values: preset.values, activatePresetID: preset.id, completion: completion)
+    }
+
+    /// 只把草稿值写入系统，不改动当前生效方案。
+    func applyDraft(_ values: [String: Int], completion: @escaping (ApplyReport) -> Void) {
+        apply(values: values, activatePresetID: nil, completion: completion)
+    }
+
+    /// 当前是否合盖（只读）。`ioreg` 中 `AppleClamshellState = Yes` 表示合盖。
+    /// 注意：ioreg 位于 /usr/sbin，不在 /usr/bin。
+    var isLidClosed: Bool {
+        let output = CommandCapture
+            .run("/usr/sbin/ioreg", ["-r", "-k", "AppleClamshellState", "-d", "4"])
+            .output
+        for line in output.split(separator: "\n") where line.contains("AppleClamshellState") {
+            let value = line.split(separator: "=").last?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            return value.caseInsensitiveCompare("Yes") == .orderedSame
+        }
+        return false
+    }
+
+    // MARK: - 方案应用（内部实现）
+
+    /// 差异下发 + 回读校验的公共流程。
+    /// - Parameters:
+    ///   - values: 目标键值（可以只包含部分键）
+    ///   - activatePresetID: 成功后要记为当前生效方案的 id；nil 表示不改（草稿应用）
+    private func apply(
+        values: [String: Int],
+        activatePresetID: String?,
+        completion: @escaping (ApplyReport) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let snapshot = SystemPowerReader().snapshot()
+
+            var targets: [(key: String, value: Int)] = []
+            var skipped: [String] = []
+            for key in self.keys {
+                guard let target = values[key] else { continue }
+                // 本机不存在的键不下发，记录后跳过
+                guard snapshot.isAvailable(key) else {
+                    skipped.append(key)
+                    continue
+                }
+                if !snapshot.matchesAllPowerModes(key, target: target) {
+                    targets.append((key, target))
+                }
+            }
+
+            // disablesleep 是系统级总开关，必须排在命令列表最后
+            var ordered = targets.filter { $0.key != "disablesleep" }
+            if let disableSleep = targets.first(where: { $0.key == "disablesleep" }) {
+                ordered.append(disableSleep)
+            }
+
+            var base = ApplyReport()
+            base.skippedKeys = skipped
+
+            guard !ordered.isEmpty else {
+                DispatchQueue.main.async {
+                    var report = base
+                    report.message = "当前已处于该方案状态，无需修改"
+                    if let id = activatePresetID {
+                        PresetStore.shared.setActive(id: id)
+                    }
+                    completion(report)
+                }
+                return
+            }
+
+            let commands = ordered.map { "/usr/bin/pmset -a \($0.key) \($0.value)" }
+            // 本次是否把 disablesleep 从 1 改回 0：合盖时改回来不会立即入睡，需要额外提示
+            let turnsOffDisableSleep = snapshot.value(for: "disablesleep") == 1
+                && ordered.contains { $0.key == "disablesleep" && $0.value == 0 }
+
+            self.runPrivileged(commands) { success, message in
+                guard success else {
+                    var report = base
+                    let reason = Self.isUserCanceled(message) ? "用户取消了授权" : message
+                    for target in ordered {
+                        report.failedKeys[target.key] = "未写入"
+                    }
+                    report.message = "写入未执行：\(reason)"
+                    completion(report)
+                    return
+                }
+                self.verify(
+                    targets: ordered,
+                    skipped: skipped,
+                    activatePresetID: activatePresetID,
+                    promptSleepNow: turnsOffDisableSleep,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    /// 执行后回读，逐键比对目标值。
+    private func verify(
+        targets: [(key: String, value: Int)],
+        skipped: [String],
+        activatePresetID: String?,
+        promptSleepNow: Bool,
+        completion: @escaping (ApplyReport) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let snapshot = SystemPowerReader().snapshot()
+            // 只有本次确实关闭了 disablesleep 时才需要读合盖状态
+            let lidClosed = promptSleepNow && self.isLidClosed
+
+            var report = ApplyReport()
+            report.skippedKeys = skipped
+            for target in targets {
+                if snapshot.matchesAllPowerModes(target.key, target: target.value) {
+                    report.appliedKeys.append(target.key)
+                } else {
+                    report.failedKeys[target.key] = snapshot.mismatchDescription(for: target.key, target: target.value)
+                }
+            }
+            report.message = self.summary(for: report)
+
+            let needsSleepPrompt = lidClosed && report.appliedKeys.contains("disablesleep")
+
+            DispatchQueue.main.async {
+                if let id = activatePresetID, report.failedKeys.isEmpty {
+                    PresetStore.shared.setActive(id: id)
+                }
+                guard needsSleepPrompt else {
+                    completion(report)
+                    return
+                }
+                self.promptSleepNowIfNeeded { sleptNow in
+                    var finalReport = report
+                    finalReport.promptedSleepNow = true
+                    if sleptNow {
+                        finalReport.message += "\n已执行立即睡眠。"
+                    }
+                    completion(finalReport)
+                }
+            }
+        }
+    }
+
+    /// 默认睡眠方案：`pmset restoredefaults` 恢复电源档位默认，并显式把系统级 `disablesleep` 归 0。
+    private func applyBuiltinDefaultPreset(completion: @escaping (ApplyReport) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let before = SystemPowerReader().snapshot()
+            let turnsOffDisableSleep = before.value(for: "disablesleep") == 1
+
+            // `pmset restoredefaults` 只恢复分电源配置，不会重置系统级的 SleepDisabled，
+            // 必须显式追加 `disablesleep 0`（放在最后，与 apply() 顺序一致）。
+            let commands = [
+                "/usr/bin/pmset restoredefaults",
+                "/usr/bin/pmset -a disablesleep 0"
+            ]
+            self.runPrivileged(commands) { success, message in
+                guard success else {
+                    var report = ApplyReport()
+                    let reason = Self.isUserCanceled(message) ? "用户取消了授权" : message
+                    report.failedKeys["restoredefaults"] = "未执行"
+                    report.message = "恢复默认设置失败：\(reason)"
+                    completion(report)
+                    return
+                }
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let snapshot = SystemPowerReader().snapshot()
+                    let lidClosed = turnsOffDisableSleep && self.isLidClosed
+
+                    let values = snapshot.defaultRecordingValues(for: self.keys)
+
+                    var report = ApplyReport()
+                    let actualDisableSleep = snapshot.value(for: "disablesleep")
+                    if actualDisableSleep != 0 {
+                        let actualText = actualDisableSleep.map(String.init) ?? "未知"
+                        report.failedKeys["disablesleep"] = "实际值 \(actualText)"
+                        report.message = "恢复默认设置未完全生效：disablesleep 仍为 \(actualText)"
+                    } else {
+                        report.appliedKeys = self.keys.filter { values[$0] != nil }
+                        report.message = "已恢复系统默认电源设置，并记录当前值到默认睡眠方案。"
+                    }
+
+                    let needsSleepPrompt = lidClosed && report.failedKeys.isEmpty
+
+                    DispatchQueue.main.async {
+                        if report.failedKeys.isEmpty {
+                            PresetStore.shared.update(id: Preset.builtinDefaultID, values: values)
+                            PresetStore.shared.setActive(id: Preset.builtinDefaultID)
+                        }
+                        guard needsSleepPrompt else {
+                            completion(report)
+                            return
+                        }
+                        self.promptSleepNowIfNeeded { sleptNow in
+                            var finalReport = report
+                            finalReport.promptedSleepNow = true
+                            if sleptNow {
+                                finalReport.message += "\n已执行立即睡眠。"
+                            }
+                            completion(finalReport)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 合盖状态下关掉 disablesleep 时的提示：可以顺手让 Mac 立即睡眠。
+    /// 文案明确说明「合盖状态下改回允许睡眠不会立即入睡」。
+    private func promptSleepNowIfNeeded(completion: @escaping (Bool) -> Void) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "已恢复允许睡眠"
+        alert.informativeText = "当前处于合盖状态。合盖状态下改回允许睡眠不会立即入睡，需要的话可以现在就让 Mac 睡眠。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "知道了")
+        alert.addButton(withTitle: "立即睡眠")
+
+        guard alert.runModal() == .alertSecondButtonReturn else {
+            completion(false)
+            return
+        }
+        runPrivileged(["/usr/bin/pmset sleepnow"]) { success, _ in
+            completion(success)
+        }
+    }
+
+    private func summary(for report: ApplyReport) -> String {
+        var parts: [String] = []
+        if !report.appliedKeys.isEmpty {
+            parts.append("已修改 \(report.appliedKeys.count) 项：\(report.appliedKeys.joined(separator: "、"))")
+        }
+        if !report.skippedKeys.isEmpty {
+            parts.append("本机不支持、已跳过：\(report.skippedKeys.joined(separator: "、"))")
+        }
+        if !report.failedKeys.isEmpty {
+            let details = report.failedKeys
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)（\($0.value)）" }
+                .joined(separator: "、")
+            parts.append("以下键写入失败：\(details)")
+        }
+        if parts.isEmpty {
+            parts.append("当前已处于该方案状态，无需修改")
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    // MARK: - 特权执行（Helper 优先，失败回退 AppleScript）
+
+    /// 统一的特权执行入口。
+    ///
+    /// 先尝试特权 Helper（授权一次后静默执行），失败则回退 AppleScript 密码方式；
+    /// 两者都失败时只把错误信息回调给上层一次，不在这里弹窗。
+    /// 回调固定回到主线程。
+    private func runPrivileged(
+        _ commands: [String],
+        completion: @escaping (_ success: Bool, _ message: String) -> Void
+    ) {
+        PrivilegedHelperManager.shared.runCommands(commands) { success, output in
+            if success {
+                completion(true, output)
+                return
+            }
+            if Self.isUserCanceled(output) {
+                completion(false, output)
+                return
+            }
+            NSLog("PMSet: helper 执行失败，回退 AppleScript：\(output)")
+
+            // Helper 不可用（未安装 / 签名不符 / 版本不匹配 / XPC 失败）：回退密码方式，用 && 保持失败即停语义
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fallback = self.executeAsAdminViaAppleScript(commands.joined(separator: " && "))
+                DispatchQueue.main.async {
+                    completion(fallback.success, fallback.success ? "" : fallback.message)
+                }
+            }
+        }
+    }
+
+    /// AppleScript 密码方式（回退路径）：`do shell script ... with administrator privileges`。
+    /// 多条命令用 `&&` 连接，确保前一条失败时不再执行后续命令，且每次操作只需输入一次密码。
+    /// 注意：不支持 Touch ID，且仅在特权 Helper 不可用时才会走到这里。
+    private func executeAsAdminViaAppleScript(_ shellCommand: String) -> AppleScriptResult {
         // 转义命令中的反斜杠和双引号，确保嵌入 AppleScript 字符串后语法正确
         let escaped = shellCommand
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -134,53 +392,29 @@ final class PMSetManager {
 
         var error: NSDictionary?
         guard let appleScript = NSAppleScript(source: script) else {
-            showError("执行失败", "无法创建 AppleScript 实例。")
-            return false
+            return AppleScriptResult(success: false, message: "无法创建 AppleScript 实例。")
         }
 
         appleScript.executeAndReturnError(&error)
 
         if let error = error {
             let message = (error[NSAppleScript.errorMessage] as? String) ?? "未知错误"
-            // 用户取消授权时不弹错误提示
-            if message.contains("User canceled") || message.contains("取消") {
-                return false
-            }
-            showError("需要管理员权限", "未授权或命令执行失败：\n\(message)")
-            return false
+            return AppleScriptResult(success: false, message: message)
         }
+        return AppleScriptResult(success: true, message: "")
+    }
 
-        return true
+    private struct AppleScriptResult {
+        let success: Bool
+        let message: String
+    }
+
+    /// 用户取消授权不算错误，调用方不应弹错误框。
+    private static func isUserCanceled(_ message: String) -> Bool {
+        message.contains("User canceled") || message.contains("取消")
     }
 
     // MARK: - 私有工具
-
-    private func value(for key: String, in output: String) -> String? {
-        for line in output.split(separator: "\n") {
-            let parts = line.split(separator: " ")
-            if parts.count >= 2, parts[0] == key {
-                return String(parts[1])
-            }
-        }
-        return nil
-    }
-
-    private func capture(_ executable: String, _ args: [String]) -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = args
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do {
-            try process.run()
-        } catch {
-            return (1, "")
-        }
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
-    }
 
     private func showInfo(_ title: String, _ message: String) {
         showAlert(title, message, .informational)

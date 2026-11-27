@@ -16,7 +16,7 @@ let package = Package(
             name: "PMSetHelper",
             dependencies: ["PMSetShared"],
             path: "Sources/PMSetHelper",
-            exclude: ["Info.plist"],
+            exclude: ["Info.plist", "launchd.plist"],
             linkerSettings: [
                 // 将 Info.plist 嵌入到二进制的 __TEXT,__info_plist section。
                 // SMJobBless 要求 Helper 二进制内置 Info.plist（含 CFBundleIdentifier 和 SMAuthorizedClients）。
@@ -33,6 +33,15 @@ let package = Package(
                     "-Xlinker", "__TEXT",
                     "-Xlinker", "__info_plist",
                     "-Xlinker", "Sources/PMSetHelper/Info.plist"
+                ]),
+                // 将 launchd.plist 嵌入到 __TEXT,__launchd_plist section。
+                // SMJobBless 必需：launchd 从这里读取 Label / MachServices 生成 LaunchDaemon，
+                // 缺失时安装失败并返回 kSMErrorJobPlistNotFound（error 8）。
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__launchd_plist",
+                    "-Xlinker", "Sources/PMSetHelper/launchd.plist"
                 ])
             ]
         ),

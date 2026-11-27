@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SMJobBless 要求 Helper 二进制内嵌一份 launchd plist（__TEXT,__launchd_plist）。
+  launchd 在安装时按这份内容生成 /Library/LaunchDaemons/local.pmset.helper.plist。
+  Label 必须与 CFBundleIdentifier（local.pmset.helper）一致，MachServices 的 key
+  必须与 App 端 NSXPCConnection 使用的 machServiceName 一致。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.pmset.helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/local.pmset.helper</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>local.pmset.helper</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

@@ -1,21 +1,148 @@
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem?
     private let manager = PMSetManager()
-    private var lidNoSleepItem: NSMenuItem?
-    private var lidSleepItem: NSMenuItem?
+
+    /// 首次启动的禁止睡眠提示只弹一次
+    private var didShowStartupWarning = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.toolTip = "PMSet"
         statusItem = item
-        item.menu = makeMenu()
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        item.menu = menu
+
+        rebuildMenu()
+        checkSleepDisabledAtLaunch()
+
+        // 配置窗口内保存 / 管理方案后，需要立即刷新菜单
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(presetStoreDidChange),
+            name: .presetStoreDidChange,
+            object: nil
+        )
+        // 首页右键菜单里的「应用」
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(presetApplyRequested(_:)),
+            name: .presetApplyRequested,
+            object: nil
+        )
     }
 
-    /// 根据「合盖不睡眠」状态返回菜单栏图标。
-    /// 新图标以模板图方式渲染，自动适配浅色/深色菜单栏与选中高亮。
+    // MARK: - 菜单刷新
+
+    /// 每次菜单展开前重建全部菜单项，保证方案增删、勾选状态与系统实际值同步。
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === statusItem?.menu {
+            rebuildMenu()
+        }
+    }
+
+    @objc private func presetStoreDidChange() {
+        rebuildMenu()
+    }
+
+    @objc private func presetApplyRequested(_ notification: Notification) {
+        guard let id = notification.userInfo?["id"] as? String,
+              let preset = PresetStore.shared.preset(id: id) else { return }
+        applyPreset(preset)
+    }
+
+    /// 按固定顺序重建菜单：查看方案 / 分隔线 / 默认睡眠方案 / 前两个自定义方案 /
+    /// 更多（条件） / 分隔线 / 关于 / 当前版本 / 分隔线 / 退出 App。
+    func rebuildMenu() {
+        guard let menu = statusItem?.menu else { return }
+        menu.removeAllItems()
+
+        let snapshot = SystemPowerReader().snapshot()
+        let checkedID = checkedPresetID(snapshot: snapshot)
+        let customs = PresetStore.shared.customPresets
+
+        menu.addItem(item("查看方案", #selector(openPresetEditor)))
+        menu.addItem(NSMenuItem.separator())
+
+        let builtin = PresetStore.shared.builtinPreset
+        menu.addItem(presetItem(builtin, checked: builtin.id == checkedID))
+
+        for preset in customs.prefix(2) {
+            menu.addItem(presetItem(preset, checked: preset.id == checkedID))
+        }
+
+        let remaining = customs.dropFirst(2)
+        if !remaining.isEmpty {
+            let moreItem = NSMenuItem(title: "更多", action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            for preset in remaining {
+                submenu.addItem(presetItem(preset, checked: preset.id == checkedID))
+            }
+            moreItem.submenu = submenu
+            menu.addItem(moreItem)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(item("关于", #selector(openAbout)))
+        // 版本号仅作展示：不设置 action，点击无响应
+        menu.addItem(
+            NSMenuItem(title: "当前版本：v\(Bundle.main.version)", action: nil, keyEquivalent: "")
+        )
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(item("退出 App", #selector(quitApp)))
+
+        // 图标以回读的实际值为准
+        statusItem?.button?.image = statusIcon(noSleep: snapshot.sleepDisabled)
+    }
+
+    // MARK: - 勾选判定
+
+    /// 勾选以回读的实际值为准：只比较方案里出现且本机可用的键，值为 0 与「缺失」不同。
+    /// 内置方案 values 为空时退化为按 activePresetID 判定。
+    private func matches(_ preset: Preset, snapshot: PowerSnapshot) -> Bool {
+        let comparable = preset.values.filter { snapshot.isAvailable($0.key) }
+        guard !comparable.isEmpty else {
+            return PresetStore.shared.activePresetID == preset.id
+        }
+        if preset.isBuiltin {
+            return snapshot.matchesBuiltinDefault(comparable: comparable)
+        }
+        return comparable.allSatisfy { snapshot.matchesAllPowerModes($0.key, target: $0.value) }
+    }
+
+    /// 同一时刻只允许一个勾选：优先取当前生效方案，其次取第一个与实际值一致的方案。
+    private func checkedPresetID(snapshot: PowerSnapshot) -> String? {
+        let all = [PresetStore.shared.builtinPreset] + PresetStore.shared.customPresets
+        let matching = all.filter { matches($0, snapshot: snapshot) }
+        let activeID = PresetStore.shared.activePresetID
+        if matching.contains(where: { $0.id == activeID }) {
+            return activeID
+        }
+        return matching.first?.id
+    }
+
+    // MARK: - 菜单项构造
+
+    private func item(_ title: String, _ action: Selector) -> NSMenuItem {
+        let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        menuItem.target = self
+        return menuItem
+    }
+
+    private func presetItem(_ preset: Preset, checked: Bool) -> NSMenuItem {
+        let menuItem = item(preset.name, #selector(presetClicked(_:)))
+        menuItem.representedObject = preset.id
+        menuItem.state = checked ? .on : .off
+        return menuItem
+    }
+
+    /// 根据「禁止睡眠」状态返回菜单栏图标（模板图，自动适配浅色/深色菜单栏）。
     private func statusIcon(noSleep: Bool) -> NSImage? {
         let name = noSleep ? "MenuBarAwake" : "MenuBarSleep"
         if let image = NSImage(named: name) {
@@ -29,68 +156,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func makeMenu() -> NSMenu {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.addItem(item("备份当前配置", #selector(backupConfig)))
-        menu.addItem(item("恢复备份配置", #selector(restoreConfig)))
-        menu.addItem(NSMenuItem.separator())
-        lidNoSleepItem = item("设置合盖不睡眠", #selector(setLidNoSleep))
-        lidSleepItem = item("设置合盖睡眠（恢复默认）", #selector(setLidSleep))
-        menu.addItem(lidNoSleepItem!)
-        menu.addItem(lidSleepItem!)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(item("关于", #selector(openAbout)))
-        // 版本号仅作展示：不设置 action，点击无响应，但保持与普通菜单项一致的文字颜色
-        let versionItem = NSMenuItem(
-            title: "当前版本：v\(Bundle.main.version)",
-            action: nil,
-            keyEquivalent: ""
-        )
-        menu.addItem(versionItem)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(item("退出App", #selector(quitApp)))
-        refreshLidState()
-        return menu
+    // MARK: - 动作
+
+    @objc private func openPresetEditor() {
+        PresetEditorWindowController.shared.show()
     }
 
-    /// 根据当前电源设置，在「合盖不睡眠 / 合盖睡眠」前打勾
-    private func refreshLidState() {
-        let noSleep = manager.isLidNoSleepEnabled()
-        lidNoSleepItem?.state = noSleep ? .on : .off
-        lidSleepItem?.state = noSleep ? .off : .on
-        statusItem?.button?.image = statusIcon(noSleep: noSleep)
+    @objc private func presetClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let preset = PresetStore.shared.preset(id: id) else { return }
+        applyPreset(preset)
     }
 
-    private func item(_ title: String, _ action: Selector) -> NSMenuItem {
-        let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        menuItem.target = self
-        return menuItem
-    }
-
-    @objc private func backupConfig() {
-        runInBackground { self.manager.backup() }
-    }
-
-    @objc private func restoreConfig() {
-        runInBackground {
-            self.manager.restore()
-            DispatchQueue.main.async { self.refreshLidState() }
+    private func applyPreset(_ preset: Preset) {
+        manager.applyPreset(preset) { report in
+            // 无论成功与否都重建菜单与图标，勾选状态以回读实际值为准
+            self.rebuildMenu()
+            // 成功且没有下发任何键时不弹窗，避免噪音
+            if report.failedKeys.isEmpty && report.appliedKeys.isEmpty { return }
+            // 已弹过「不会立即入睡」的询问框，不再追加成功弹窗（失败仍要提示）
+            if report.failedKeys.isEmpty && report.promptedSleepNow { return }
+            self.showReport(report, presetName: preset.name)
         }
     }
 
-    @objc private func setLidNoSleep() {
-        runInBackground {
-            self.manager.setLidNoSleep()
-            DispatchQueue.main.async { self.refreshLidState() }
+    /// 汇总应用结果：失败时列出具体键名与原因。
+    private func showReport(_ report: ApplyReport, presetName: String) {
+        var lines: [String] = []
+        if !report.message.isEmpty {
+            lines.append(report.message)
         }
-    }
-
-    @objc private func setLidSleep() {
-        runInBackground {
-            self.manager.setLidSleep()
-            DispatchQueue.main.async { self.refreshLidState() }
+        let failed = report.failedKeys.sorted { $0.key < $1.key }
+        if !failed.isEmpty {
+            lines.append(failed.map { "• \($0.key)：\($0.value)" }.joined(separator: "\n"))
         }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = failed.isEmpty ? .informational : .warning
+        alert.messageText = failed.isEmpty ? "「\(presetName)」已应用" : "「\(presetName)」应用未完成"
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.addButton(withTitle: "好")
+        alert.runModal()
     }
 
     @objc private func openAbout() {
@@ -102,8 +208,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    private func runInBackground(_ work: @escaping () -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async(execute: work)
+    // MARK: - 首次启动提示
+
+    /// 首次启动检测到「禁止睡眠」时提示一次，只提示，不自动修改配置。
+    private func checkSleepDisabledAtLaunch() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let snapshot = SystemPowerReader().snapshot()
+            guard snapshot.sleepDisabled else { return }
+            DispatchQueue.main.async {
+                guard !self.didShowStartupWarning else { return }
+                self.didShowStartupWarning = true
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "当前处于「禁止睡眠」状态"
+                alert.informativeText = "当前处于『禁止睡眠』状态（合盖也不会睡），建议切换到『默认睡眠方案』恢复。"
+                alert.addButton(withTitle: "知道了")
+                alert.runModal()
+            }
+        }
     }
 }
 

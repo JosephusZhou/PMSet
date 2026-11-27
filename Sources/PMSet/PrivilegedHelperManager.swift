@@ -1,31 +1,20 @@
 // ============================================================================
-// ⚠️ 预留代码：SMJobBless 特权 Helper Tool 方案
+// SMJobBless 特权 Helper Tool（已启用）
 // ============================================================================
 //
-// 当前版本未启用此方案。PMSetManager 采用更简洁的 AppleScript 方式
-// （`do shell script ... with administrator privileges`），每次执行特权操作
-// 时弹出密码输入框（不支持 Touch ID），无需任何代码签名证书。
+// PMSetManager 的所有特权电源写入都优先走这里：
+//   1. ensureHelperReady()：Helper 已安装且版本与 App 内置版本一致时直接复用，
+//      版本不一致（或未安装）时自动重装，用户只需授权一次；
+//   2. runCommands(_:completion:)：通过 XPC 让 Helper 以 root 身份执行白名单内的
+//      pmset 命令，后续操作静默完成，不再弹密码框。
 //
-// 本文件及以下相关文件保留为未来升级预留：
-//   - Sources/PMSet/PrivilegedHelperManager.swift（本文件）
-//   - Sources/PMSetShared/HelperProtocol.swift
-//   - Sources/PMSetHelper/main.swift + Info.plist
-//   - Info.plist 中的 SMPrivilegedExecutables
+// 【自动回退】Helper 未安装、安装被拒绝、版本不匹配或 XPC 调用失败时，
+// PMSetManager 会自动回退到 AppleScript 密码方式，功能结果一致。
 //
-// 【为什么需要证书】
-// SMJobBless 安装的 Helper 由 launchd 以 root 身份拉起。launchd 拒绝加载
-// ad-hoc 签名的二进制（会报 CFErrorDomainLaunchd error 8），必须使用正式的
-// 代码签名证书（Apple Development / Developer ID / 自签名证书均可）。
-//
-// 【未来启用步骤】
-// 1. 获得固定的代码签名证书（如 Developer ID Application）。
-// 2. 用该证书签名 App 和 Helper：
-//      bash build-app.sh --sign "Developer ID Application: XXX"
-// 3. 在 PMSetManager 中，将 runAsAdmin() 的实现替换为：
-//      PrivilegedHelperManager.shared.runCommands(commands) { success, output in ... }
-// 4. 启用后用户只需授权一次，后续所有特权操作静默执行，不再弹框。
-//
-// 【当前状态】未调用，仅编译保留。
+// 【签名要求】SMJobBless 安装的 Helper 由 launchd 以 root 身份拉起，launchd 拒绝
+// 加载 ad-hoc 签名的二进制（CFErrorDomainLaunchd error 8），因此分发构建必须使用
+// 正式签名身份：bash build-app.sh --sign "Developer ID Application: XXX"。
+// ad-hoc 构建下 Helper 装不上，但不会阻塞功能，只会回退到密码方式。
 // ============================================================================
 
 import Foundation
@@ -33,8 +22,6 @@ import ServiceManagement
 import PMSetShared
 
 /// 负责特权 Helper Tool 的安装、版本校验与 XPC 通信。
-///
-/// - Note: 当前版本未启用，详见文件顶部的预留说明。
 final class PrivilegedHelperManager {
 
     static let shared = PrivilegedHelperManager()
@@ -42,7 +29,8 @@ final class PrivilegedHelperManager {
     // MARK: - 常量
 
     let helperBundleID = "local.pmset.helper"
-    let helperVersion = "1.0.0"
+    /// 必须与 Helper 端 kHelperVersion 保持一致；版本不一致会触发自动重装。
+    let helperVersion = "1.1.0"
 
     private var helperInstallPath: String {
         "/Library/PrivilegedHelperTools/\(helperBundleID)"
@@ -59,6 +47,7 @@ final class PrivilegedHelperManager {
     // MARK: - 状态
 
     private var connection: NSXPCConnection?
+    private let connectionLock = NSLock()
     /// 最近一次安装失败的错误信息，供 UI 展示。
     private(set) var lastErrorMessage: String = ""
 
@@ -122,8 +111,8 @@ final class PrivilegedHelperManager {
         process.standardError = pipe
         do {
             try process.run()
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             return String(data: data, encoding: .utf8) ?? "(无法读取签名信息)"
         } catch {
             return "签名检查失败: \(error.localizedDescription)"
@@ -206,8 +195,7 @@ final class PrivilegedHelperManager {
         if success {
             NSLog("PMSet: SMJobBless succeeded")
             lastErrorMessage = ""
-            connection?.invalidate()
-            connection = nil
+            resetConnection()
             return (true, "")
         }
 
@@ -233,13 +221,14 @@ final class PrivilegedHelperManager {
             let code = CFErrorGetCode(cfErrorRef)
             NSLog("PMSet: SMJobBless failed: domain=\(domain), code=\(code), message=\(message)")
 
-            // 常见错误码的中文解释
-            if domain == "com.apple.ServiceManagement" {
+            if code == Int(errAuthorizationCanceled) {
+                message = "用户取消了授权。"
+            } else if domain == "com.apple.ServiceManagement" {
                 switch code {
                 case 3:
                     message += "（错误码 3：签名无效或 requirement 不匹配）"
                 case 4:
-                    message += "（错误码 4：授权失败）"
+                    message += "（错误码 4：授权已取消或失败）"
                 case 5:
                     message += "（错误码 5：Helper 工具无效或 Info.plist 缺失）"
                 case 7:
@@ -269,16 +258,46 @@ final class PrivilegedHelperManager {
 
     // MARK: - XPC 通信
 
-    func getHelper() -> HelperProtocol? {
-        if connection == nil {
-            let conn = NSXPCConnection(machServiceName: helperBundleID)
-            conn.remoteObjectInterface = NSXPCInterface(with: HelperProtocol.self)
-            conn.resume()
-            connection = conn
+    private func activeConnection() -> NSXPCConnection {
+        connectionLock.lock()
+        defer { connectionLock.unlock() }
+
+        if let existing = connection {
+            return existing
         }
-        return connection?.remoteObjectProxyWithErrorHandler { error in
-            NSLog("PMSet: XPC error: \(error)")
-        } as? HelperProtocol
+        let conn = NSXPCConnection(machServiceName: helperBundleID)
+        conn.remoteObjectInterface = NSXPCInterface(with: HelperProtocol.self)
+        conn.invalidationHandler = { [weak self, weak conn] in
+            guard let self, let conn else { return }
+            self.resetConnection(ifMatching: conn)
+        }
+        conn.interruptionHandler = {
+            NSLog("PMSet: XPC connection interrupted")
+        }
+        conn.resume()
+        connection = conn
+        return conn
+    }
+
+    private func resetConnection(ifMatching target: NSXPCConnection? = nil) {
+        connectionLock.lock()
+        let old: NSXPCConnection?
+        if let target {
+            if connection === target {
+                old = connection
+                connection = nil
+            } else {
+                old = nil
+            }
+        } else {
+            old = connection
+            connection = nil
+        }
+        connectionLock.unlock()
+        // 避免在持有锁时触发 invalidationHandler 再次加锁
+        if target == nil {
+            old?.invalidate()
+        }
     }
 
     /// 便捷方法：确保 Helper 就绪后，以 root 身份执行一组命令。
@@ -286,26 +305,43 @@ final class PrivilegedHelperManager {
         _ commands: [String],
         completion: @escaping (_ success: Bool, _ output: String) -> Void
     ) {
+        let finishLock = NSLock()
+        var finished = false
+        let finish: (Bool, String) -> Void = { success, output in
+            finishLock.lock()
+            let alreadyFinished = finished
+            finished = true
+            finishLock.unlock()
+            guard !alreadyFinished else { return }
+            DispatchQueue.main.async {
+                completion(success, output)
+            }
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             let ready = self.ensureHelperReady()
             guard ready.success else {
-                DispatchQueue.main.async {
-                    completion(false, ready.errorMessage)
-                }
+                finish(false, ready.errorMessage)
                 return
             }
 
-            guard let helper = self.getHelper() else {
-                DispatchQueue.main.async {
-                    completion(false, "无法连接到特权辅助工具。")
+            let conn = self.activeConnection()
+            let proxy = conn.remoteObjectProxyWithErrorHandler { [weak self, weak conn] error in
+                NSLog("PMSet: XPC error: \(error)")
+                if let conn {
+                    self?.resetConnection(ifMatching: conn)
+                    conn.invalidate()
                 }
+                finish(false, "XPC 通信失败：\(error.localizedDescription)")
+            } as? HelperProtocol
+
+            guard let helper = proxy else {
+                finish(false, "无法连接到特权辅助工具。")
                 return
             }
 
             helper.runCommands(commands) { success, output in
-                DispatchQueue.main.async {
-                    completion(success, output)
-                }
+                finish(success, output)
             }
         }
     }

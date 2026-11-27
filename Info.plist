@@ -29,10 +29,10 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <!--
-      预留配置：SMJobBless 特权 Helper Tool 方案。
-      当前版本未启用（采用 AppleScript 方式，无需证书）。
-      未来获得固定代码签名证书后，可启用此方案实现"授权一次、永久静默"。
-      详见 Sources/PMSet/PrivilegedHelperManager.swift 顶部说明。
+      SMJobBless 特权 Helper Tool 已启用。
+      App 端所有特权写入优先通过 XPC 调用 Helper；安装或调用失败时自动回退
+      AppleScript 密码方式，功能不受影响。
+      注意：ad-hoc 签名下 Helper 无法被 launchd 加载属预期行为。
     -->
     <key>SMPrivilegedExecutables</key>
     <dict>
