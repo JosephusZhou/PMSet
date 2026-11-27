@@ -54,30 +54,32 @@ jobs:
           codesign --force --sign - "$APP/Contents/Library/LaunchServices/local.pmset.helper"
           codesign --force --sign - "$APP"
           file "$APP/Contents/MacOS/PMSet"
-      - name: Package DMG (arm64)
-        continue-on-error: true
-        id: dmg_arm64
+      - name: Package DMGs
         run: |
-          APP="PMSet-arm64.app"
-          rm -rf "$APP"
-          cp -r PMSet.app "$APP"
-          lipo -extract arm64 "$APP/Contents/MacOS/PMSet" -output "$APP/Contents/MacOS/PMSet"
-          file "$APP/Contents/MacOS/PMSet"
-          codesign --force --sign - "$APP"
-          hdiutil create -volname "PMSet" -srcfolder "$APP" -ov -format UDZO "PMSet-arm64.dmg"
-          rm -rf "$APP"
-      - name: Package DMG (x86_64)
-        continue-on-error: true
-        id: dmg_x86_64
-        run: |
-          APP="PMSet-x86_64.app"
-          rm -rf "$APP"
-          cp -r PMSet.app "$APP"
-          lipo -extract x86_64 "$APP/Contents/MacOS/PMSet" -output "$APP/Contents/MacOS/PMSet"
-          file "$APP/Contents/MacOS/PMSet"
-          codesign --force --sign - "$APP"
-          hdiutil create -volname "PMSet" -srcfolder "$APP" -ov -format UDZO "PMSet-x86_64.dmg"
-          rm -rf "$APP"
+          for ARCH in arm64 x86_64; do
+            STAGE="dmg-$ARCH"
+            APP="$STAGE/PMSet.app"
+            set +e
+            (
+              set -euo pipefail
+              rm -rf "$STAGE"
+              mkdir -p "$STAGE"
+              cp -R PMSet.app "$APP"
+              lipo -extract "$ARCH" "$APP/Contents/MacOS/PMSet" -output "$APP/Contents/MacOS/PMSet"
+              file "$APP/Contents/MacOS/PMSet"
+              codesign --force --sign - "$APP/Contents/Library/LaunchServices/local.pmset.helper"
+              codesign --force --sign - "$APP"
+              codesign --verify --deep --strict "$APP"
+              ln -s /Applications "$STAGE/Applications"
+              hdiutil create -volname "PMSet" -srcfolder "$STAGE" -ov -format UDZO "PMSet-$ARCH.dmg"
+            )
+            rc=$?
+            set -e
+            rm -rf "$STAGE"
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning::Failed to package PMSet-$ARCH.dmg (exit $rc)"
+            fi
+          done
       - name: Verify DMGs
         run: |
           if [ ! -f "PMSet-arm64.dmg" ] && [ ! -f "PMSet-x86_64.dmg" ]; then
